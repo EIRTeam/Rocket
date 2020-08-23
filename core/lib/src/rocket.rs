@@ -1,5 +1,4 @@
 use std::{io, mem};
-use std::cmp::min;
 use std::sync::Arc;
 use std::collections::HashMap;
 
@@ -17,9 +16,9 @@ use crate::{logger, handler};
 use crate::config::{Config, FullConfig, ConfigError, LoggedValue};
 use crate::request::{Request, FormItems};
 use crate::data::Data;
+use crate::catcher::Catcher;
 use crate::response::{Body, Response};
 use crate::router::{Router, Route};
-use crate::catcher::{self, Catcher};
 use crate::outcome::Outcome;
 use crate::error::{LaunchError, LaunchErrorKind};
 use crate::fairing::{Fairing, Fairings};
@@ -39,7 +38,7 @@ pub struct Rocket {
     pub(crate) managed_state: Container,
     manifest: Vec<PreLaunchOp>,
     router: Router,
-    default_catchers: HashMap<u16, Catcher>,
+    default_catcher: Option<Catcher>,
     catchers: HashMap<u16, Catcher>,
     fairings: Fairings,
     shutdown_receiver: Option<mpsc::Receiver<()>>,
@@ -73,12 +72,14 @@ impl Rocket {
               Paint::blue(&base),
               Paint::magenta(":"));
 
-        for mut route in routes {
-            let path = route.uri.clone();
-            if let Err(e) = route.set_uri(base.clone(), path) {
-                error_!("{}", e);
-                panic!("Invalid route URI.");
-            }
+        for route in routes {
+            let old_route = route.clone();
+            let route = route.map_base(|old| format!("{}{}", base, old))
+                .unwrap_or_else(|e| {
+                    error_!("Route `{}` has a malformed URI.", old_route);
+                    error_!("{}", e);
+                    panic!("Invalid route URI.");
+                });
 
             info_!("{}", route);
             self.router.add(route);
@@ -89,14 +90,17 @@ impl Rocket {
     fn _register(&mut self, catchers: Vec<Catcher>) {
         info!("{}{}", Paint::emoji("👾 "), Paint::magenta("Catchers:"));
 
-        for c in catchers {
-            if self.catchers.get(&c.code).map_or(false, |e| !e.is_default) {
-                info_!("{} {}", c, Paint::yellow("(warning: duplicate catcher!)"));
-            } else {
-                info_!("{}", c);
-            }
+        for catcher in catchers {
+            info_!("{}", catcher);
 
-            self.catchers.insert(c.code, c);
+            let existing = match catcher.code {
+                Some(code) => self.catchers.insert(code, catcher),
+                None => self.default_catcher.replace(catcher)
+            };
+
+            if let Some(existing) = existing {
+                warn_!("Replacing existing '{}' catcher.", existing);
+            }
         }
     }
 
@@ -118,7 +122,7 @@ impl Rocket {
             manifest: vec![],
             config: Config::development(),
             router: Router::new(),
-            default_catchers: HashMap::new(),
+            default_catcher: None,
             catchers: HashMap::new(),
             managed_state: Container::new(),
             fairings: Fairings::new(),
@@ -206,10 +210,10 @@ async fn hyper_service_fn(
         };
 
         // Retrieve the data from the hyper body.
-        let data = Data::from_hyp(h_body).await;
+        let mut data = Data::from_hyp(h_body).await;
 
         // Dispatch the request to get a response, then write that response out.
-        let token = rocket.preprocess_request(&mut req, &data).await;
+        let token = rocket.preprocess_request(&mut req, &mut data).await;
         let r = rocket.dispatch(token, &mut req, data).await;
         rocket.issue_response(r, tx).await;
     });
@@ -298,16 +302,16 @@ impl Rocket {
     pub(crate) async fn preprocess_request(
         &self,
         req: &mut Request<'_>,
-        data: &Data
+        data: &mut Data
     ) -> Token {
         // Check if this is a form and if the form contains the special _method
         // field which we use to reinterpret the request's method.
-        let data_len = data.peek().len();
         let (min_len, max_len) = ("_method=get".len(), "_method=delete".len());
+        let peek_buffer = data.peek(max_len).await;
         let is_form = req.content_type().map_or(false, |ct| ct.is_form());
 
-        if is_form && req.method() == Method::Post && data_len >= min_len {
-            if let Ok(form) = std::str::from_utf8(&data.peek()[..min(data_len, max_len)]) {
+        if is_form && req.method() == Method::Post && peek_buffer.len() >= min_len {
+            if let Ok(form) = std::str::from_utf8(peek_buffer) {
                 let method: Option<Result<Method, _>> = FormItems::from(form)
                     .filter(|item| item.key.as_str() == "_method")
                     .map(|item| item.value.parse())
@@ -355,8 +359,8 @@ impl Rocket {
 
             // Set the cookies. Note that error responses will only include
             // cookies set by the error handler. See `handle_error` for more.
-            for cookie in request.cookies().delta() {
-                response.adjoin_header(cookie);
+            for crumb in request.cookies().delta() {
+                response.adjoin_header(crumb)
             }
 
             response
@@ -457,19 +461,25 @@ impl Rocket {
             req.cookies().reset_delta();
 
             // Try to get the active catcher but fallback to user's 500 catcher.
-            let catcher = self.catchers.get(&status.code).unwrap_or_else(|| {
-                error_!("No catcher found for {}. Using 500 catcher.", status);
-                self.catchers.get(&500).expect("500 catcher.")
-            });
+            let code = Paint::red(status.code);
+            let response = if let Some(catcher) = self.catchers.get(&status.code) {
+                catcher.handler.handle(status, req).await
+            } else if let Some(ref default) =  self.default_catcher {
+                warn_!("No {} catcher found. Using default catcher.", code);
+                default.handler.handle(status, req).await
+            } else {
+                warn_!("No {} or default catcher found. Using Rocket default catcher.", code);
+                crate::catcher::default(status, req)
+            };
 
-            // Dispatch to the user's catcher. If it fails, use the default 500.
-            match catcher.handle(req).await {
-                Ok(r) => return r,
+            // Dispatch to the catcher. If it fails, use the Rocket default 500.
+            match response {
+                Ok(r) => r,
                 Err(err_status) => {
-                    error_!("Catcher failed with status: {}!", err_status);
-                    warn_!("Using default 500 error catcher.");
-                    let default = self.default_catchers.get(&500).expect("Default 500");
-                    default.handle(req).await.expect("Default 500 response.")
+                    error_!("Catcher unexpectedly failed with {}.", err_status);
+                    warn_!("Using Rocket's default 500 error catcher.");
+                    let default = crate::catcher::default(Status::InternalServerError, req);
+                    default.expect("Rocket has default 500 response")
                 }
             }
         }
@@ -641,7 +651,7 @@ impl Rocket {
         }
 
         if config.secret_key.is_generated() && config.environment.is_prod() {
-            warn!("environment is 'production', but no `secret_key` is configured");
+            warn!("environment is 'production' but no `secret_key` is configured");
         }
 
         for (name, value) in config.extras() {
@@ -658,8 +668,8 @@ impl Rocket {
             shutdown_handle: Shutdown(shutdown_sender),
             manifest: vec![],
             router: Router::new(),
-            default_catchers: catcher::defaults::get(),
-            catchers: catcher::defaults::get(),
+            default_catcher: None,
+            catchers: HashMap::new(),
             fairings: Fairings::new(),
             shutdown_receiver: Some(shutdown_receiver),
         }
@@ -720,12 +730,12 @@ impl Rocket {
     pub fn mount<R: Into<Vec<Route>>>(mut self, base: &str, routes: R) -> Self {
         let base_uri = Origin::parse_owned(base.to_string())
             .unwrap_or_else(|e| {
-                error_!("Invalid origin URI '{}' used as mount point.", base);
+                error!("Invalid mount point URI: {}.", Paint::white(base));
                 panic!("Error: {}", e);
             });
 
         if base_uri.query().is_some() {
-            error_!("Mount point '{}' contains query string.", base);
+            error!("Mount point '{}' contains query string.", base);
             panic!("Invalid mount point.");
         }
 

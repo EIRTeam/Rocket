@@ -438,7 +438,7 @@ more about request guards and implementing them, see the [`FromRequest`]
 documentation.
 
 [`FromRequest`]: @api/rocket/request/trait.FromRequest.html
-[`Cookies`]: @api/rocket/http/enum.Cookies.html
+[`CookieJar`]: @api/rocket/http/struct.CookieJar.html
 
 ### Custom Guards
 
@@ -568,34 +568,33 @@ it always succeeds. The user is redirected to a log in page.
 
 ## Cookies
 
-[`Cookies`] is an important, built-in request guard: it allows you to get, set,
-and remove cookies. Because `Cookies` is a request guard, an argument of its
-type can simply be added to a handler:
+A reference to a [`CookieJar`] is an important, built-in request guard: it
+allows you to get, set, and remove cookies. Because `&CookieJar` is a request
+guard, an argument of its type can simply be added to a handler:
 
 ```rust
 # #[macro_use] extern crate rocket;
 # fn main() {}
-use rocket::http::Cookies;
+use rocket::http::CookieJar;
 
 #[get("/")]
-fn index(cookies: Cookies) -> Option<String> {
-    cookies.get("message")
-        .map(|value| format!("Message: {}", value))
+fn index(cookies: &CookieJar<'_>) -> Option<String> {
+    cookies.get("message").map(|crumb| format!("Message: {}", crumb.value()))
 }
 ```
 
 This results in the incoming request's cookies being accessible from the
 handler. The example above retrieves a cookie named `message`. Cookies can also
-be set and removed using the `Cookies` guard. The [cookies example] on GitHub
-illustrates further use of the `Cookies` type to get and set cookies, while the
-[`Cookies`] documentation contains complete usage information.
+be set and removed using the `CookieJar` guard. The [cookies example] on GitHub
+illustrates further use of the `CookieJar` type to get and set cookies, while
+the [`CookieJar`] documentation contains complete usage information.
 
 [cookies example]: @example/cookies
 
 ### Private Cookies
 
-Cookies added via the [`Cookies::add()`] method are set _in the clear._ In other
-words, the value set is visible by the client. For sensitive data, Rocket
+Cookies added via the [`CookieJar::add()`] method are set _in the clear._ In
+other words, the value set is visible to the client. For sensitive data, Rocket
 provides _private_ cookies.
 
 Private cookies are just like regular cookies except that they are encrypted
@@ -612,37 +611,25 @@ methods are suffixed with `_private`. These methods are: [`get_private`],
 # #[macro_use] extern crate rocket;
 # fn main() {}
 
-use rocket::http::{Cookie, Cookies};
+use rocket::http::{Cookie, CookieJar};
 use rocket::response::{Flash, Redirect};
 
 /// Retrieve the user's ID, if any.
 #[get("/user_id")]
-fn user_id(mut cookies: Cookies) -> Option<String> {
+fn user_id(cookies: &CookieJar<'_>) -> Option<String> {
     cookies.get_private("user_id")
-        .map(|cookie| format!("User ID: {}", cookie.value()))
+        .map(|crumb| format!("User ID: {}", crumb.value()))
 }
 
 /// Remove the `user_id` cookie.
 #[post("/logout")]
-fn logout(mut cookies: Cookies) -> Flash<Redirect> {
+fn logout(cookies: &CookieJar<'_>) -> Flash<Redirect> {
     cookies.remove_private(Cookie::named("user_id"));
     Flash::success(Redirect::to("/"), "Successfully logged out.")
 }
 ```
 
-[`Cookies::add()`]: @api/rocket/http/enum.Cookies.html#method.add
-
-Support for private cookies, which depends on the [`ring`] library, can be
-omitted at build time by disabling Rocket's default features, in-turn disabling
-the default `private-cookies` feature. To do so, modify your `Cargo.toml` file
-so that you depend on `rocket` as follows:
-
-```toml
-[dependencies]
-rocket = { version = "0.5.0-dev", default-features = false }
-```
-
-[`ring`]: https://github.com/briansmith/ring
+[`CookieJar::add()`]: @api/rocket/http/struct.CookieJar.html#method.add
 
 ### Secret Key
 
@@ -662,81 +649,9 @@ can be generated with the command `openssl rand -base64 32`.
 For more information on configuration, see the [Configuration](../configuration)
 section of the guide.
 
-[`get_private`]: @api/rocket/http/enum.Cookies.html#method.get_private
-[`add_private`]: @api/rocket/http/enum.Cookies.html#method.add_private
-[`remove_private`]: @api/rocket/http/enum.Cookies.html#method.remove_private
-
-### One-At-A-Time
-
-For safety reasons, Rocket currently requires that at most one `Cookies`
-instance be active at a time. It's uncommon to run into this restriction, but it
-can be confusing to handle if it does crop up.
-
-If this does happen, Rocket will emit messages to the console that look as
-follows:
-
-```text
-=> Error: Multiple `Cookies` instances are active at once.
-=> An instance of `Cookies` must be dropped before another can be retrieved.
-=> Warning: The retrieved `Cookies` instance will be empty.
-```
-
-The messages will be emitted when a violating handler is called. The issue can
-be resolved by ensuring that two instances of `Cookies` cannot be active at once
-due to the offending handler. A common error is to have a handler that uses a
-`Cookies` request guard as well as a `Custom` request guard that retrieves
-`Cookies`, as so:
-
-```rust
-# #[macro_use] extern crate rocket;
-# fn main() {}
-# use rocket::http::Cookies;
-# type Custom = rocket::http::Method;
-
-#[get("/")]
-fn bad(cookies: Cookies, custom: Custom) { /* .. */ }
-```
-
-Because the `cookies` guard will fire before the `custom` guard, the `custom`
-guard will retrieve an instance of `Cookies` when one already exists for
-`cookies`. This scenario can be fixed by simply swapping the order of the
-guards:
-
-```rust
-# #[macro_use] extern crate rocket;
-# fn main() {}
-# use rocket::http::Cookies;
-# type Custom = rocket::http::Method;
-
-#[get("/")]
-fn good(custom: Custom, cookies: Cookies) { /* .. */ }
-```
-
-When using request guards that modify cookies on-demand, such as
-`FlashMessage`, a similar problem occurs. The fix in this case is to `drop` the
-`Cookies` instance before accessing the `FlashMessage`.
-
-```rust
-# #[macro_use] extern crate rocket;
-# fn main() {}
-
-# use rocket::http::Cookies;
-use rocket::request::FlashMessage;
-
-#[get("/")]
-fn bad(cookies: Cookies, flash: FlashMessage) {
-    // Oh no! `flash` holds a reference to `Cookies` too!
-    let msg = flash.msg();
-}
-
-#[get("/")]
-fn good(cookies: Cookies, flash: FlashMessage) {
-    std::mem::drop(cookies);
-
-    // Now, `flash` holds an _exclusive_ reference to `Cookies`. Whew.
-    let msg = flash.msg();
-}
-```
+[`get_private`]: @api/rocket/http/struct.CookieJar.html#method.get_private
+[`add_private`]: @api/rocket/http/struct.CookieJar.html#method.add_private
+[`remove_private`]: @api/rocket/http/struct.CookieJar.html#method.remove_private
 
 ## Format
 
@@ -1037,36 +952,39 @@ The only condition is that the generic type in `Json` implements the
 
 Sometimes you just want to handle incoming data directly. For example, you might
 want to stream the incoming data out to a file. Rocket makes this as simple as
-possible via the [`Data`](@api/rocket/data/struct.Data.html)
-type:
+possible via the [`Data`](@api/rocket/data/struct.Data.html) type:
 
 ```rust
 # #[macro_use] extern crate rocket;
 # fn main() {}
 
-use rocket::Data;
+use rocket::data::{Data, ToByteUnit};
 use rocket::response::Debug;
 
 #[post("/upload", format = "plain", data = "<data>")]
 async fn upload(data: Data) -> Result<String, Debug<std::io::Error>> {
-    Ok(data.stream_to_file("/tmp/upload.txt").await.map(|n| n.to_string())?)
+    let bytes_written = data.open(128.kibibytes())
+        .stream_to_file("/tmp/upload.txt")
+        .await?;
+
+    Ok(bytes_written.to_string())
 }
 ```
 
 The route above accepts any `POST` request to the `/upload` path with
-`Content-Type: text/plain`  The incoming data is streamed out to
-`tmp/upload.txt`, and the number of bytes written is returned as a plain text
-response if the upload succeeds. If the upload fails, an error response is
-returned. The handler above is complete. It really is that simple! See the
-[GitHub example code](@example/raw_upload) for the full crate.
+`Content-Type: text/plain`  At most 128KiB (`128 << 10` bytes) of the incoming
+data are streamed out to `tmp/upload.txt`, and the number of bytes written is
+returned as a plain text response if the upload succeeds. If the upload fails,
+an error response is returned. The handler above is complete. It really is that
+simple! See the [GitHub example code](@example/raw_upload) for the full crate.
 
-! warning: You should _always_ set limits when reading incoming data.
+! note: Rocket requires setting limits when reading incoming data.
 
-  To prevent DoS attacks, you should limit the amount of data you're willing to
-  accept. The [`take()`] reader adapter makes doing this easy:
-  `data.open().take(LIMIT)`.
-
-  [`take()`]: https://doc.rust-lang.org/std/io/trait.Read.html#method.take
+  To aid in preventing DoS attacks, Rocket requires you to specify, as a
+  [`ByteUnit`](@api/rocket/data/struct.ByteUnit.html), the amount of data you're
+  willing to accept from the client when `open`ing a data stream. The
+  [`ToByteUnit`](@api/rocket/data/trait.ToByteUnit.html) trait makes specifying
+  such a value as idiomatic as `128.kibibytes()`.
 
 ## Async Routes
 
@@ -1088,27 +1006,26 @@ function, so we must `await` it.
 
 ## Error Catchers
 
-Routing may fail for a variety of reasons. These include:
+Application processing is fallible. Errors arise from the following sources:
 
-  * A guard fails.
-  * A handler returns a [`Responder`](../responses/#responder) that fails.
-  * No routes matched.
+  * A failing guard.
+  * A failing responder.
+  * A routing failure.
 
-If any of these conditions occur, Rocket returns an error to the client. To do
-so, Rocket invokes the _catcher_ corresponding to the error's status code.
+If any of these occur, Rocket returns an error to the client. To generate the
+error, Rocket invokes the _catcher_ corresponding to the error's status code.
 Catchers are similar to routes except in that:
 
   1. Catchers are only invoked on error conditions.
   2. Catchers are declared with the `catch` attribute.
   3. Catchers are _registered_ with [`register()`] instead of [`mount()`].
   4. Any modifications to cookies are cleared before a catcher is invoked.
-  5. Error catchers cannot invoke guards of any sort.
+  5. Error catchers cannot invoke guards.
+  6. Error catchers should not fail to produce a response.
 
-Rocket provides default catchers for all of the standard HTTP error codes. To
-override a default catcher, or declare a catcher for a custom status code, use
-the [`catch`] attribute, which takes a single integer corresponding to the HTTP
-status code to catch. For instance, to declare a catcher for `404 Not Found`
-errors, you'd write:
+To declare a catcher for a given status code, use the [`catch`] attribute, which
+takes a single integer corresponding to the HTTP status code to catch. For
+instance, to declare a catcher for `404 Not Found` errors, you'd write:
 
 ```rust
 # #[macro_use] extern crate rocket;
@@ -1120,8 +1037,10 @@ use rocket::Request;
 fn not_found(req: &Request) { /* .. */ }
 ```
 
-As with routes, the return type (here `T`) must implement `Responder`. A
-concrete implementation may look like:
+Catchers may take zero, one, or two arguments. If the catcher takes one
+argument, it must be of type [`&Request`]. It it takes two, they must be of type
+[`Status`] and [`&Request`], in that order. As with routes, the return type must
+implement `Responder`. A concrete implementation may look like:
 
 ```rust
 # #[macro_use] extern crate rocket;
@@ -1152,12 +1071,38 @@ fn main() {
 }
 ```
 
-Unlike route request handlers, catchers take exactly zero or one parameter. If
-the catcher takes a parameter, it must be of type [`&Request`]. The [error
-catcher example](@example/errors) on GitHub illustrates their use in full.
+### Default Catchers
+
+If no catcher for a given status code has been registered, Rocket calls the
+_default_ catcher. Rocket provides a default catcher for all applications
+automatically, so providing one is usually unnecessary. Rocket's built-in
+default catcher can handle all errors. It produces HTML or JSON, depending on
+the value of the `Accept` header. As such, a default catcher, or catchers in
+general, only need to be registered if an error needs to be handled in a custom
+fashion.
+
+Declaring a default catcher is done with `#[catch(default)]`:
+
+```rust
+# #[macro_use] extern crate rocket;
+# fn main() {}
+
+use rocket::Request;
+use rocket::http::Status;
+
+#[catch(default)]
+fn default_catcher(status: Status, request: &Request) { /* .. */ }
+```
+
+It must similarly be registered with [`register()`].
+
+The [error catcher example](@example/errors) illustrates their use in full,
+while the [`Catcher`] API documentation provides further details.
 
 [`catch`]: @api/rocket/attr.catch.html
 [`register()`]: @api/rocket/struct.Rocket.html#method.register
 [`mount()`]: @api/rocket/struct.Rocket.html#method.mount
 [`catchers!`]: @api/rocket/macro.catchers.html
 [`&Request`]: @api/rocket/struct.Request.html
+[`Status`]: @api/rocket/http/struct.Status.html
+[`Catcher`]: @api/rocket/catcher/struct.Catcher.html
